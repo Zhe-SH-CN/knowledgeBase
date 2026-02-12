@@ -7,11 +7,9 @@ import gc
 from pathlib import Path
 from loguru import logger
 from concurrent.futures import ProcessPoolExecutor
-# os.chdir("../../../")
-print(os.getcwd())
 
 # ================= 1. 环境配置 =================
-os.environ['MINERU_MODEL_SOURCE'] = "local"
+os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
 os.environ['MINERU_DEVICE_MODE'] = "cuda:0"
 os.environ['MODELSCOPE_LOG_LEVEL'] = '40'
 
@@ -119,7 +117,7 @@ class EdgeScholarBatchEngine:
         # 调用核心分析 API
         infer_results, all_images, all_docs, langs, ocrs = pipeline_doc_analyze(
             batch_bytes, ['en'] * len(valid_data), 
-            formula_enable=False, table_enable=False
+            formula_enable=False, table_enable=True
         )
         
         gpu_duration = time.perf_counter() - t_gpu_start
@@ -127,18 +125,15 @@ class EdgeScholarBatchEngine:
 
         # --- Step 4: 结果保存 ---
         logger.info("💾 正在保存结构化 Markdown 报告...")
-        t_save_start = time.perf_counter()
         for i, data in enumerate(valid_data):
             self.save_paper_result(data, infer_results[i], all_images[i], all_docs[i], langs[i], ocrs[i])
-        save_duration = time.perf_counter() - t_save_start
-        logger.info(f"✅ 结果保存完成！耗时: {save_duration:.2f}s (平均: {save_duration/len(valid_data):.2f}s/篇)")
-        total_time = cpu_duration + gpu_duration +  save_duration
+
+        total_time = cpu_duration + gpu_duration
         print("\n" + "="*50)
         print(f"📊 批处理性能报告 (n={len(valid_data)})")
         print("-" * 50)
         print(f"平均 CPU 剪枝耗时:   {cpu_duration/len(valid_data):.4f}s")
         print(f"平均 GPU 推理耗时:   {gpu_duration/len(valid_data):.4f}s")
-        print(f"平均 结果保存耗时:   {save_duration/len(valid_data):.4f}s")
         print(f"单篇平均处理速度:    {total_time/len(valid_data):.4f}s")
         print(f"系统总吞吐量:        {60 / (total_time/len(valid_data)):.2f} papers/min")
         print("="*50)
@@ -170,6 +165,6 @@ class EdgeScholarBatchEngine:
             logger.error(f"保存结果时出错 {name}: {e}")
 
 if __name__ == "__main__":
-    engine = EdgeScholarBatchEngine("./output/test_optimized_minerU")
+    engine = EdgeScholarBatchEngine("./output_batch_test")
     # 一次性跑 10 篇
-    engine.run_benchmark("./input/osdi2025", batch_size=10)
+    engine.run_benchmark("./osdi2025", batch_size=10)

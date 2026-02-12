@@ -6,3 +6,6 @@ models/*
 *.log
 .venv/
 __pycache__/
+.ruff_cache/
+input.txt
+mineru.json
