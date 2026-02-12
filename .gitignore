@@ -1,0 +1,8 @@
+# Ignore contents of these folders but keep the directories
+input/*
+output/*
+models/*
+# Ignore all .log files
+*.log
+.venv/
+__pycache__/
