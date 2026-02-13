@@ -91,35 +91,80 @@ def cpu_save_worker(data_pack):
         img_folder = paper_folder / "images"
         
         # --- A. 视觉组件顺序处理 ---
+# --- B. 视觉组件处理 (修复路径拼接与递归搜索) ---
         visual_md = ""
         if middle_json_dict:
             img_idx = 0
-            processed_hashes = {} 
+            # 记录 {旧文件名(hash): 新文件名(index)}，防止多处引用同一张图时重复重命名
+            renamed_map = {} 
+            
+            # 1. 定义递归查找器：找出所有含图片的 block
+            def get_visual_blocks(obj):
+                found = []
+                if isinstance(obj, dict):
+                    # 判断是否是视觉块
+                    if obj.get("img_path") or obj.get("table_img_path"):
+                        found.append(obj)
+                    # 递归查找子元素
+                    for k, v in obj.items():
+                        found.extend(get_visual_blocks(v))
+                elif isinstance(obj, list):
+                    for item in obj:
+                        found.extend(get_visual_blocks(item))
+                return found
 
-            for page in middle_json_dict.get("pdf_info", []):
-                for block in page.get("pre_markdown_res", []):
-                    img_path_raw = block.get("img_path") or block.get("table_img_path")
-                    if img_path_raw:
-                        if img_path_raw not in processed_hashes:
-                            ext = os.path.splitext(img_path_raw)[1]
-                            new_name = f"{name}-{img_idx}{ext}"
-                            
-                            old_p = img_folder / img_path_raw
-                            new_p = img_folder / new_name
-                            
-                            if old_p.exists():
-                                os.rename(old_p, new_p)
-                                processed_hashes[img_path_raw] = new_name
-                                img_idx += 1
+            # 获取所有视觉块
+            all_visual_blocks = get_visual_blocks(middle_json_dict)
+
+            # 2. 处理图片重命名与 MD 生成
+            for block in all_visual_blocks:
+                # 获取原始路径 (可能是 "images/xxx_hash.jpg" 或 "xxx_hash.jpg")
+                raw_rel_path = block.get("img_path") or block.get("table_img_path")
+                if not raw_rel_path: continue
+
+                # 【关键修复】：只提取文件名，忽略 JSON 里的目录前缀
+                hash_filename = Path(raw_rel_path).name 
+                
+                # 构造物理路径
+                old_file_path = img_folder / hash_filename
+                
+                # 确定新文件名
+                if hash_filename in renamed_map:
+                    # 如果已经重命名过（同一张图被多次引用），直接复用
+                    final_name = renamed_map[hash_filename]
+                else:
+                    # 如果是新图，生成新名字
+                    if old_file_path.exists():
+                        ext = old_file_path.suffix
+                        new_name = f"{name}-{img_idx}{ext}"
+                        new_file_path = img_folder / new_name
                         
-                        final_name = processed_hashes.get(img_path_raw)
-                        if final_name:
-                            tag = "📊 Table" if "table" in block.get("type", "") else "🖼️ Figure"
-                            visual_md += f"### {tag}: {final_name}\n"
-                            if block.get("caption"):
-                                visual_md += f"> **Caption:** {block['caption']}\n\n"
-                            visual_md += f"![](images/{final_name})\n\n"
+                        try:
+                            os.rename(old_file_path, new_file_path)
+                            # 记录映射关系
+                            renamed_map[hash_filename] = new_name
+                            final_name = new_name
+                            img_idx += 1
+                        except OSError:
+                            # 如果重命名失败（极少见），沿用旧名
+                            final_name = hash_filename
+                    else:
+                        # 图片文件物理丢失，跳过生成 MD
+                        # logger.warning(f"Image missing: {old_file_path}")
+                        continue
 
+                # 3. 生成 Markdown
+                # 区分表格和图片
+                block_type = block.get("type", "").lower()
+                tag = "📊 Table" if "table" in block_type else "🖼️ Figure"
+                caption = block.get("caption", "").strip()
+                
+                visual_md += f"### {tag} {img_idx} (Source: Page {block.get('page_idx', '?')})\n"
+                if caption:
+                    visual_md += f"> **Caption:** {caption}\n\n"
+                
+                # 写入图片链接
+                visual_md += f"![](images/{final_name})\n\n"
         # --- B. 文本切片逻辑 (包含之前缺失的 conclusion_text 计算) ---
         # 1. 拼合全文用于搜索
         all_pages_indices = sorted(meta['all_texts_dict'].keys())

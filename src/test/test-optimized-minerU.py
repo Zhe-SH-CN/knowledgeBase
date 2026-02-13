@@ -11,7 +11,7 @@ from concurrent.futures import ProcessPoolExecutor
 # ================= 1. 环境配置 =================
 os.environ['MINERU_MODEL_SOURCE'] = "local"
 os.environ['MINERU_DEVICE_MODE'] = "cuda:0"
-os.environ['MODELSCOPE_LOG_LEVEL'] = 'ERROR'
+os.environ['MODELSCOPE_LOG_LEVEL'] = '40'
 fitz.TOOLS.mupdf_display_errors(False)
 
 from mineru.cli.common import prepare_env
@@ -95,21 +95,41 @@ def cpu_save_worker(data_pack):
         # 拼合全文文本
         full_text = "\n".join([meta['all_texts_dict'][i] for i in sorted(meta['all_texts_dict'].keys())])
         
-        # 正则寻找 Conclusion
-        re_conc = re.compile(r'\n#?\s*(?:\d\.?\s+)?(?:Conclusion|CONCLUSION|Summary)', re.I)
-        re_stop = re.compile(r'\n#?\s*(?:\d\.?\s+)?(?:Related Work|RELATED WORK|References|REFERENCES|Bibliography|Appendix|APPENDIX)', re.I)
+        # 在前两页的front_text中寻找 Abstract 和 Introduction 的位置
+        front_text = meta['front_text']
+        re_abst = re.compile(r'(Abstract|ABSTRACT)', re.M)
+        re_intro = re.compile(r'\n\s*(?:1\.?\s+)?(Introduction|INTRODUCTION)', re.I | re.M)
         
-        conc_final = "Conclusion section not clearly identified."
+        abs_m = re_abst.search(front_text)
+        intro_m = re_intro.search(front_text)
+        
+        metadata_part = front_text[:abs_m.start()].strip() if abs_m else "Not Found"
+        
+        if abs_m and intro_m:
+            abstract_part = front_text[abs_m.start():intro_m.start()].strip()
+            # Introduction 取从标题开始到后续 3000 字符（防止太长）
+            introduction_part = front_text[intro_m.start():intro_m.start()+3000].strip()
+        else:
+            abstract_part = "Not Found"
+            introduction_part = "Not Found"
+        
+        # 正则寻找 Conclusion
+        re_conc = re.compile(r'\n#?\s*(?:\d\.?\s+)?(?:Conclusion|CONCLUSION|Summary)', re.I | re.M)
+        re_ref = re.compile(r'\n#?\s*(?:References|REFERENCES|Bibliography|参考文献)', re.I | re.M)
+        re_related = re.compile(r'\n#?\s*(?:\d\.?\s+)?(?:Related Work|RELATED WORK)', re.I | re.M)
+        re_stop = re.compile(r'\n#?\s*(?:\d\.?\s+)?(?:Related Work|RELATED WORK|References|REFERENCES|Bibliography|Appendix|APPENDIX)', re.I)
+
+        conc_final = "Conclusion not identified."
         conc_match = re_conc.search(full_text)
         if conc_match:
             start_pos = conc_match.start()
-            # 从 Conclusion 之后寻找终点锚点
-            after_conc = full_text[conc_match.end():]
-            stop_match = re_stop.search(after_conc)
-            if stop_match:
-                conc_final = full_text[start_pos : conc_match.end() + stop_match.start()]
-            else:
-                conc_final = full_text[start_pos : start_pos + 1500] # 没找到终点则截取 1500 字
+        # 从 Conclusion 之后寻找终点锚点
+        after_conc = full_text[conc_match.end():]
+        stop_match = re_stop.search(after_conc)
+        if stop_match:
+            conc_final = full_text[start_pos : conc_match.end() + stop_match.start()]
+        else:
+            conc_final = full_text[start_pos : start_pos + 1500] # 没找到终点则截取 1500 字
 
         # --- B. 渲染视觉组件并重命名图片 ---
         visual_md = ""
@@ -130,14 +150,18 @@ def cpu_save_worker(data_pack):
 
         # --- C. 缝合最终报告 ---
         final_md = f"""# {name} Analysis Report
+## 0. Meta(Before Abstract)
+{metadata_part}
 
 ## 1. Abstract
-{meta['front_text']}
+{abstract_part}
 
 ---
 ## 2. Introduction
+{introduction_part}
 
 ## 3. Methodology
+Skipped
 
 ## 4. Conclusion & Findings
 {conc_final}
