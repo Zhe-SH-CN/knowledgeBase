@@ -13,7 +13,6 @@ from concurrent.futures import ProcessPoolExecutor
 os.environ['MINERU_MODEL_SOURCE'] = "local"
 os.environ['MINERU_DEVICE_MODE'] = "cuda:0"
 os.environ['MODELSCOPE_LOG_LEVEL'] = '40'
-
 fitz.TOOLS.mupdf_display_errors(False)
 
 from mineru.cli.common import prepare_env
@@ -23,35 +22,69 @@ from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc
 from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
 from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
 
-# ================= 2. 预处理 Worker (保持你的逻辑) =================
+# ================= 2. 增强版 CPU 预处理 Worker =================
 
 def cpu_pre_process_worker(pdf_path):
     try:
-        re_ref = re.compile(r'^\s*(?:References|REFERENCES|Bibliography)', re.I | re.M)
+        # 更加严格的章节定位正则
+        # 匹配：References, Bibliography 等
+        re_ref = re.compile(r'\n#?\s*(?:References|REFERENCES|Bibliography|参考文献)', re.I)
+        # 匹配：Related Work, Background 等
+        re_related = re.compile(r'\n#?\s*(?:\d\.?\s+)?(?:Related Work|RELATED WORK|Background|Prior Work)', re.I)
+        # 匹配：Figure/Table 引用
         re_visual = re.compile(r'\b(Table|Figure|Fig\.)\s+\d+\b', re.I)
 
         doc = fitz.open(pdf_path)
         total_pages = doc.page_count
-        idx_ref = -1
-        page_info = [] 
-        ocr_indices = []
         
-        for i, page in enumerate(doc):
+        page_raw_texts = {}
+        ocr_indices = []
+        idx_ref = -1
+        
+        for i in range(total_pages):
+            page = doc[i]
+            # --- 核心：全量开启 blocks+sort=True ---
             blocks = page.get_text("blocks", sort=True)
             txt = "\n".join([b[4] for b in blocks if b[6] == 0])
+            page_raw_texts[i] = txt
             
-            if idx_ref == -1 and i > total_pages * 0.5 and re_ref.search(txt):
-                idx_ref = i
+            # 定位 References 所在页
+            if idx_ref == -1 and i > total_pages * 0.5:
+                if re_ref.search(txt):
+                    idx_ref = i
             
-            if self_is_visual(page, txt, re_visual):
-                # 遵循你的逻辑：仅在引用页之前进行 OCR
+            # 视觉感知判定：只要有图片或 Table/Figure 引用，就标记为 OCR 页
+            if len(page.get_images()) > 0 or re_visual.search(txt):
+                # 排除参考文献之后的页，减少冗余
                 if idx_ref == -1 or i <= idx_ref:
-                    page_info.append({"type": "ocr", "page_idx": i})
                     ocr_indices.append(i)
-            else:
-                page_info.append({"type": "text", "content": txt, "page_idx": i})
 
-        # 生成微型 PDF
+        # --- 语义提取逻辑 ---
+        # 1. Front Matter: 无损保留前两页全部文本
+        front_text = ""
+        for i in range(min(2, total_pages)):
+            front_text += page_raw_texts.get(i, "") + "\n"
+
+        # 2. Conclusion: 动态回溯提取
+        # 逻辑：取 Ref 页 + Ref 前一页，然后切掉不需要的部分
+        conclusion_raw = ""
+        if idx_ref != -1:
+            # 获取 Ref 所在页及其前一页
+            start_p = max(2, idx_ref - 1) # 避开前两页
+            for p in range(start_p, idx_ref + 1):
+                conclusion_raw += page_raw_texts.get(p, "") + "\n"
+            
+            # 剪枝 A: 切掉 References 及其之后的所有内容
+            conclusion_clean = re_ref.split(conclusion_raw)[0]
+            # 剪枝 B: 切掉 Related Work (如果在结论后面)
+            conclusion_clean = re_related.split(conclusion_clean)[0]
+            # 保留该区域最后的 3500 字符（通常涵盖了完整的 Conclusion 和部分 Evaluation 总结）
+            conclusion_final = conclusion_clean[-3500:]
+        else:
+            # 没找到 Ref，取最后两页
+            conclusion_final = "\n".join([page_raw_texts.get(i, "") for i in range(max(0, total_pages-2), total_pages)])
+
+        # 生成用于 MinerU 处理的微型 PDF (仅含图表页)
         pruned_bytes = None
         if ocr_indices:
             new_doc = fitz.open()
@@ -65,81 +98,61 @@ def cpu_pre_process_worker(pdf_path):
             "name": Path(pdf_path).stem,
             "ocr_bytes": pruned_bytes,
             "ocr_mapping": ocr_indices,
-            "page_structure": page_info,
+            "front_text": front_text,
+            "conclusion_text": conclusion_final,
             "status": "success"
         }
     except Exception as e:
         return {"status": "error", "error": str(e), "name": Path(pdf_path).stem}
 
-def self_is_visual(page, txt, re_visual):
-    if len(page.get_images()) > 0: return True
-    if re_visual.search(txt): return True
-    return False
-
-# ================= 3. 多核保存 Worker (接收序列化 dict) =================
+# ================= 3. CPU 结果保存与缝合 Worker =================
 
 def cpu_save_worker(data_pack):
     """
-    负责：1. 文本精准切片 2. 缝合视觉组件 3. 异步存盘
+    多核并行处理：保存为精美的 Markdown 文件
     """
     (middle_json_dict, meta, output_root) = data_pack
     name = meta['name']
     try:
-        # 准备路径
         local_image_dir, local_md_dir = prepare_env(output_root, name, "pipeline")
+        image_writer = FileBasedDataWriter(local_image_dir)
         
-        # --- 1. 文本切片逻辑 (只取精华) ---
-        # 拼合所有文本页
-        full_raw_text = ""
-        for page in meta['page_structure']:
-            if page['type'] == 'text':
-                full_raw_text += page['content'] + "\n"
-        
-        # A. 前两页精华
-        front_text = ""
-        count = 0
-        for p in meta['page_structure']:
-            if p['type'] == 'text':
-                front_text += p['content'] + "\n"
-                count += 1
-            if count >= 2: break
-        
-        # B. 方法论定位 (2000字)
-        re_method = re.compile(r'^\s*(?:2|3|II|III)\.?\s+(?:Method|Proposed|System|Architecture|Design)', re.I | re.M)
-        m_match = re_method.search(full_raw_text)
-        method_text = full_raw_text[m_match.start():m_match.start()+2000] if m_match else ""
-
-        # C. 结论定位 (References 之前 2000字)
-        re_ref = re.compile(r'\n#+\s+(?:References|REFERENCES|Bibliography|参考文献)', re.I)
-        ref_parts = re_ref.split(full_raw_text)
-        pre_ref_text = ref_parts[0]
-        # 剔除 Related Work
-        re_related = re.compile(r'\n#+\s+(?:Related Work|RELATED WORK)', re.I)
-        conclusion_text = re_related.split(pre_ref_text)[0][-2000:]
-
-        # --- 2. 视觉组件解析 (利用序列化后的 dict) ---
+        # 渲染 MinerU 的视觉输出 (表格、公式、图片占位符)
         visual_md = ""
         if middle_json_dict:
-            # 渲染视觉部分的 Markdown (仅含图片/表格占位符)
             visual_md = pipeline_union_make(middle_json_dict["pdf_info"], MakeMode.MM_MD, str(Path(local_image_dir).name))
 
-        # --- 3. 缝合最终输出 (用于喂给 Qwen) ---
-        qwen_prompt = f"# {name}\n\n[FRONT MATTER]\n{front_text[:3000]}\n\n"
-        if method_text:
-            qwen_prompt += f"[METHODOLOGY SNIPPET]\n{method_text}\n\n"
-        qwen_prompt += f"[CONCLUSION SNIPPET]\n{conclusion_text}\n\n"
-        qwen_prompt += f"[VISUAL ASSETS]\n{visual_md}"
+        # 构造 Markdown 报告
+        report_md = f"""# {name} Analysis Report
 
-        # 存盘
-        with open(Path(local_md_dir) / f"{name}_qwen_input.txt", "w", encoding="utf-8", errors="replace") as f:
-            f.write(qwen_prompt)
+## 📄 [PART 1] Front Matter (Abstract & Intro)
+{meta['front_text']}
+
+---
+
+## 🔍 [PART 2] Visual Evidence (Tables & Figures)
+> **Note:** These assets are extracted via MinerU OCR from relevant pages.
+{visual_md}
+
+---
+
+## 🏁 [PART 3] Conclusion & Findings
+{meta['conclusion_text']}
+
+---
+*Generated by EdgeScholar Heterogeneous Pipeline*
+"""
+        # 保存 Markdown 文件
+        save_path = Path(local_md_dir) / f"{name}_report.md"
+        with open(save_path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(report_md)
             
         return True
     except Exception as e:
         logger.error(f"Save error for {name}: {e}")
         return False
 
-# ================= 4. 主引擎 =================
+# ================= 4. 主执行引擎 =================
 
 class EdgeScholarBatchEngine:
     def __init__(self, output_root):
@@ -149,52 +162,40 @@ class EdgeScholarBatchEngine:
         abs_folder = os.path.abspath(pdf_folder)
         pdf_paths = [os.path.join(abs_folder, f) for f in os.listdir(abs_folder) if f.lower().endswith(".pdf")][:batch_size]
         
-        # 1. Warm-up (使用你的 sample.pdf 逻辑)
-        logger.info("🔥 正在预热模型...")
+        logger.info("🔥 加载权重并预热...")
         sample_path = "./input/sample.pdf"
         if os.path.exists(sample_path):
             with open(sample_path, "rb") as f:
                 _ = pipeline_doc_analyze([f.read()], ['en'], formula_enable=False, table_enable=False)
-        else:
-            logger.warning("预热文件 sample.pdf 不存在，使用第一篇论文预热")
-            _ = pipeline_doc_analyze([open(pdf_paths[0], "rb").read()], ['en'], formula_enable=False, table_enable=False)
 
-        # 2. CPU 多核剪枝扫描
-        logger.info(f"⚙️ 正在并行扫描 {len(pdf_paths)} 篇论文...")
+        # Step 2: 多核扫描与精准剪枝
+        logger.info(f"⚙️ 正在执行结构化扫描 (CPU 并行)...")
         t_cpu_start = time.perf_counter()
         with ProcessPoolExecutor(max_workers=min(len(pdf_paths), 10)) as executor:
             meta_list = list(executor.map(cpu_pre_process_worker, pdf_paths))
         valid_meta = [m for m in meta_list if m['status'] == 'success']
 
-        # 3. GPU 批量推理
+        # Step 3: GPU 批量推理
         ocr_needed_data = [m for m in valid_meta if m['ocr_bytes'] is not None]
-        serialized_outputs = {} # 存放脱敏后的字典
+        serialized_outputs = {}
         
         if ocr_needed_data:
-            logger.info(f"🚀 启动 GPU 推理，处理 {len(ocr_needed_data)} 篇含图页...")
+            logger.info(f"🚀 启动 GPU 推理，处理 {len(ocr_needed_data)} 篇论文的图表页...")
             batch_bytes = [m['ocr_bytes'] for m in ocr_needed_data]
             results = pipeline_doc_analyze(batch_bytes, ['en']*len(batch_bytes), formula_enable=False, table_enable=False)
             
-            # --- 关键：在主进程完成 dict 转换，解决 Pickle 报错 ---
-            logger.info("⚡ 转换数据结构为可序列化 Dict...")
+            # 主进程进行 dict 转换以规避 Pickle 报错
             for i, m in enumerate(ocr_needed_data):
-                # 这一步将 C 对象的 infer_result 转换为纯 Python Dict
                 local_image_dir, _ = prepare_env(self.output_root, m['name'], "pipeline")
                 image_writer = FileBasedDataWriter(local_image_dir)
-                
-                # 转换为 dict (注意：这里会产生 I/O 保存图片)
                 middle_json = pipeline_result_to_middle_json(
                     results[0][i], results[1][i], results[2][i], 
                     image_writer, "en", True, formula_enabled=False
                 )
                 serialized_outputs[m['name']] = middle_json
 
-        gpu_time = time.perf_counter() - t_cpu_start
-        logger.info(f"⚡ 推理与结构转换完成，耗时: {gpu_time:.2f}s")
-
-        # 4. CPU 多核并行切片与保存 (Markdown生成)
-        logger.info("💾 启动多核并行文本切片与保存...")
-        t_save_start = time.perf_counter()
+        # Step 4: 多核结果缝合
+        logger.info("💾 正在并行生成 Markdown 报告...")
         save_tasks = []
         for m in valid_meta:
             m_dict = serialized_outputs.get(m['name'], None)
@@ -203,12 +204,10 @@ class EdgeScholarBatchEngine:
         with ProcessPoolExecutor(max_workers=min(len(save_tasks), 8)) as executor:
             list(executor.map(cpu_save_worker, save_tasks))
             
-        save_time = time.perf_counter() - t_save_start
-        logger.info(f"✅ 保存耗时: {save_time:.2f}s")
-        
         total_dur = time.perf_counter() - t_cpu_start
-        logger.info(f"📊 系统总吞吐量: {60 / (total_dur/len(valid_meta)):.2f} papers/min")
+        logger.info(f"🎉 全部处理完成！输出文件夹: {self.output_root}")
+        logger.info(f"📊 系统总吞吐量: {(total_dur/len(valid_meta)):.2f} seconds/paper")
 
 if __name__ == "__main__":
-    engine = EdgeScholarBatchEngine("./output/mineru_final_v4")
+    engine = EdgeScholarBatchEngine("./output/mineru_final_v5")
     engine.run_benchmark("./input/osdi2025", batch_size=10)
