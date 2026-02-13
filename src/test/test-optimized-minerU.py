@@ -21,7 +21,7 @@ from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc
 from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
 from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
 
-# ================= 2. 增强版 CPU 预处理 Worker =================
+# ================= 2. CPU 预处理 Worker (文本提取与剪枝) =================
 
 def cpu_pre_process_worker(pdf_path):
     try:
@@ -37,6 +37,7 @@ def cpu_pre_process_worker(pdf_path):
         
         for i in range(total_pages):
             page = doc[i]
+            # 使用 blocks 和 sort=True 解决双栏乱序
             blocks = page.get_text("blocks", sort=True)
             txt = "\n".join([b[4] for b in blocks if b[6] == 0])
             page_raw_texts[i] = txt
@@ -44,16 +45,17 @@ def cpu_pre_process_worker(pdf_path):
             if idx_ref == -1 and i > total_pages * 0.5:
                 if re_ref.search(txt): idx_ref = i
             
+            # 视觉感知：只要有图片或引用就标记 OCR
             if len(page.get_images()) > 0 or re_visual.search(txt):
                 if idx_ref == -1 or i <= idx_ref:
                     ocr_indices.append(i)
 
-        # 1. Front Matter: 前两页全量文本
+        # 提取前两页作为 Front Matter
         front_text = ""
         for i in range(min(2, total_pages)):
             front_text += page_raw_texts.get(i, "") + "\n"
 
-        # 2. 生成用于推理的微型 PDF
+        # 生成用于推理的微型 PDF
         pruned_bytes = None
         if ocr_indices:
             new_doc = fitz.open()
@@ -68,94 +70,99 @@ def cpu_pre_process_worker(pdf_path):
             "ocr_bytes": pruned_bytes,
             "ocr_mapping": ocr_indices,
             "front_text": front_text,
-            "all_texts_dict": page_raw_texts, # 传递给保存进程用于切片
+            "all_pages_text": page_raw_texts,
             "status": "success"
         }
     except Exception as e:
         return {"status": "error", "error": str(e), "name": Path(pdf_path).stem}
 
-# ================= 3. CPU 多核保存与切片 Worker (v3.4) =================
+# ================= 3. CPU 结果缝合 Worker (v3.5 修复版) =================
 
 def cpu_save_worker(data_pack):
     """
-    负责：
-    1. 文本精准切片（Conclusion 提取）
-    2. 视觉组件渲染
-    3. 图片规范化重命名 (pdfname-idx.jpg)
+    负责：文本切片、图片重命名、Markdown 合成
     """
-    (middle_json_dict, meta, output_root) = data_pack
+    (middle_json_clean, meta, output_root) = data_pack
     name = meta['name']
     try:
-        # 定义输出路径，不加 pipeline 前缀
         paper_folder = Path(output_root) / name
         img_folder = paper_folder / "images"
         os.makedirs(img_folder, exist_ok=True)
         
-        # --- A. 文本精准切片逻辑 ---
-        # 拼合全文文本
-        full_text = "\n".join([meta['all_texts_dict'][i] for i in sorted(meta['all_texts_dict'].keys())])
+        # --- A. 文本精准切片 ---
+        all_txt = "\n".join([meta['all_pages_text'][i] for i in sorted(meta['all_pages_text'].keys())])
         
-        # 正则寻找 Conclusion
+        # 1. Methodology / Experiments (截取 2k)
+        re_method = re.compile(r'\n#?\s*(?:\d\.?\s+)?(?:Method|Proposed|System|Architecture|Design|Experiment|Evaluation)', re.I)
+        method_match = re_method.search(all_txt)
+        method_txt = all_txt[method_match.start():method_match.start()+2000] if method_match else "Methodology not found."
+
+        # 2. Conclusion (定位起点，拦截 Related Work/Ref/Appendix)
         re_conc = re.compile(r'\n#?\s*(?:\d\.?\s+)?(?:Conclusion|CONCLUSION|Summary)', re.I)
         re_stop = re.compile(r'\n#?\s*(?:\d\.?\s+)?(?:Related Work|RELATED WORK|References|REFERENCES|Bibliography|Appendix|APPENDIX)', re.I)
-        
-        conc_final = "Conclusion section not clearly identified."
-        conc_match = re_conc.search(full_text)
+        conc_txt = "Conclusion not found."
+        conc_match = re_conc.search(all_txt)
         if conc_match:
-            start_pos = conc_match.start()
-            # 从 Conclusion 之后寻找终点锚点
-            after_conc = full_text[conc_match.end():]
-            stop_match = re_stop.search(after_conc)
-            if stop_match:
-                conc_final = full_text[start_pos : conc_match.end() + stop_match.start()]
-            else:
-                conc_final = full_text[start_pos : start_pos + 3000] # 没找到终点则截取 3000 字
+            rest = all_txt[conc_match.end():]
+            stop_match = re_stop.search(rest)
+            # 修复：不直接在 f-string 中进行 join 操作
+            end_idx = conc_match.end() + stop_match.start() if stop_match else conc_match.start() + 2500
+            conc_txt = all_txt[conc_match.start() : end_idx]
 
-        # --- B. 渲染视觉组件并重命名图片 ---
-        visual_md = ""
-        if middle_json_dict:
-            # 执行渲染 (图片会自动存入 img_folder)
-            visual_md = pipeline_union_make(middle_json_dict["pdf_info"], MakeMode.MM_MD, "images")
+        # --- B. 视觉元素解析与图片重命名 ---
+        visual_md_list = []
+        if middle_json_clean:
+            asset_idx = 0
+            for page in middle_json_clean.get("pdf_info", []):
+                for block in page.get("pre_markdown_res", []):
+                    if block.get("type") in ["table", "image", "figure"]:
+                        raw_img_path = block.get("img_path") or block.get("table_img_path")
+                        if not raw_img_path: continue
+                        
+                        old_p = img_folder / raw_img_path
+                        if old_p.exists():
+                            ext = old_p.suffix
+                            new_name = f"{name}-{asset_idx}{ext}"
+                            os.rename(old_p, img_folder / new_name)
+                            
+                            # 构造 MD 片段
+                            cap = block.get("caption", "").strip()
+                            tag = "📊 Table" if block["type"] == "table" else "🖼️ Figure"
+                            item_md = f"## {tag}: {new_name}\n"
+                            if cap: item_md += f"> **Caption:** {cap}\n\n"
+                            item_md += f"![](images/{new_name})\n"
+                            visual_md_list.append(item_md)
+                            asset_idx += 1
 
-            # 物理重命名图片：随机哈希 -> 论文名-index
-            # 排序确保 index 相对稳定
-            cur_imgs = sorted([f for f in os.listdir(img_folder) if f.endswith(('.jpg', '.png'))])
-            for i, old_name in enumerate(cur_imgs):
-                ext = os.path.splitext(old_name)[1]
-                new_name = f"{name}-{i}{ext}"
-                # 物理重命名
-                os.rename(img_folder / old_name, img_folder / new_name)
-                # 替换 Markdown 中的路径引用
-                visual_md = visual_md.replace(f"images/{old_name}", f"images/{new_name}")
+        # --- C. 组装 Markdown ---
+        # 修复 f-string backslash error: 先在外部 join
+        visual_section = "\n".join(visual_md_list) if visual_md_list else "No visual assets extracted."
+        
+        final_md = f"""# Paper: {name}
 
-        # --- C. 缝合最终报告 ---
-        final_md = f"""# {name} Analysis Report
+## Abstract & Introduction
+{meta['front_text'].strip()}
 
-## 📄 [PART 1] Front Matter
-{meta['front_text']}
+## Methodology / Experiments
+{method_txt.strip()}
+
+## Conclusion
+{conc_txt.strip()}
+
+## Figures & Tables
+{visual_section}
 
 ---
-
-## 🔍 [PART 2] Visual Evidence
-{visual_md}
-
----
-
-## 🏁 [PART 3] Conclusion & Findings
-{conc_final}
-
----
-*Generated by EdgeScholar Heterogeneous Pipeline v3.4*
+*EdgeScholar Optimized MD v3.5*
 """
         with open(paper_folder / f"{name}_report.md", "w", encoding="utf-8", errors="replace") as f:
             f.write(final_md)
-            
         return True
     except Exception as e:
-        logger.error(f"Error saving {name}: {e}")
+        logger.error(f"Save error for {name}: {e}")
         return False
 
-# ================= 4. 主执行引擎 =================
+# ================= 4. 主引擎 =================
 
 class EdgeScholarBatchEngine:
     def __init__(self, output_root):
@@ -165,54 +172,65 @@ class EdgeScholarBatchEngine:
         abs_folder = os.path.abspath(pdf_folder)
         pdf_paths = [os.path.join(abs_folder, f) for f in os.listdir(abs_folder) if f.lower().endswith(".pdf")][:batch_size]
         
-        logger.info("🔥 预热显卡资源...")
-        sample_path = "./input/sample.pdf"
-        if os.path.exists(sample_path):
-            _ = pipeline_doc_analyze([open(sample_path, "rb").read()], ['en'], formula_enable=False)
+        t_all_start = time.perf_counter()
 
-        # Step 2: CPU 并行扫描
-        t_start = time.perf_counter()
+        # 1. Warm-up
+        logger.info("🔥 预热模型环境...")
+        sample_p = "./input/sample.pdf"
+        if os.path.exists(sample_p):
+            _ = pipeline_doc_analyze([open(sample_p, "rb").read()], ['en'], formula_enable=False)
+
+        # 2. CPU 预处理 (Scan & Prune)
+        t_scan_start = time.perf_counter()
         with ProcessPoolExecutor(max_workers=min(len(pdf_paths), 10)) as executor:
             meta_list = list(executor.map(cpu_pre_process_worker, pdf_paths))
         valid_meta = [m for m in meta_list if m['status'] == 'success']
+        scan_dur = time.perf_counter() - t_scan_start
+        logger.info(f"✅ CPU 扫描完成，平均每篇耗时: {scan_dur/len(valid_meta):.2f}s")
 
-        # Step 3: GPU 批量推理
+        # 3. GPU 推理 + 结构解构 (主进程处理以避开 Pickle 错误)
         ocr_needed_data = [m for m in valid_meta if m['ocr_bytes'] is not None]
         serializable_results = {}
         
+        t_gpu_start = time.perf_counter()
         if ocr_needed_data:
-            logger.info(f"🚀 GPU 推理: {len(ocr_needed_data)} 篇含图论文...")
+            logger.info(f"🚀 GPU 推理: 处理 {len(ocr_needed_data)} 篇含图论文...")
             batch_bytes = [m['ocr_bytes'] for m in ocr_needed_data]
             results = pipeline_doc_analyze(batch_bytes, ['en']*len(batch_bytes), formula_enable=False, table_enable=False)
             
-            # --- 关键修复：在主进程转为纯 Dict，解决 ctypes 序列化问题 ---
-            logger.info("⚡ 转换 C 对象为可序列化 Dict...")
+            # --- 关键：在主进程转为纯 Dict ---
             for i, m in enumerate(ocr_needed_data):
+                # 创建对应论文的图片目录
                 paper_img_dir = Path(self.output_root) / m['name'] / "images"
                 os.makedirs(paper_img_dir, exist_ok=True)
                 
-                # 这一步会将 results 里的指针解构成可序列化的字典数据
-                # 注意：为了获取完整的 middle_json，必须传入 image_writer
+                # 转换为可序列化字典 (此过程会保存原始图片)
                 image_writer = FileBasedDataWriter(str(paper_img_dir))
-                middle_json_dict = pipeline_result_to_middle_json(
+                middle_json = pipeline_result_to_middle_json(
                     results[0][i], results[1][i], results[2][i], 
                     image_writer, "en", True, formula_enabled=False
                 )
-                serializable_results[m['name']] = middle_json_dict
+                serializable_results[m['name']] = middle_json
 
-        # Step 4: 多核并行保存
-        logger.info("💾 多核并行保存 v3.4 (图片重命名 + 文本深度切片)...")
+        gpu_dur = time.perf_counter() - t_gpu_start
+        logger.info(f"⚡ GPU 推理与数据脱敏完成，平均每篇: {gpu_dur/len(valid_meta):.2f}s")
+
+        # 4. CPU 多核保存 (Markdown 渲染与重命名)
+        t_save_start = time.perf_counter()
         save_tasks = []
         for m in valid_meta:
-            res_dict = serializable_results.get(m['name'], None)
-            save_tasks.append((res_dict, m, self.output_root))
+            clean_dict = serializable_results.get(m['name'], None)
+            save_tasks.append((clean_dict, m, self.output_root))
 
         with ProcessPoolExecutor(max_workers=min(len(save_tasks), 8)) as executor:
             list(executor.map(cpu_save_worker, save_tasks))
+        
+        save_dur = time.perf_counter() - t_save_start
+        logger.info(f"✅ 多核保存完成，平均每篇: {save_dur/len(valid_meta):.2f}s")
             
-        logger.info(f"📊 平均耗时: {((time.perf_counter()-t_start)/len(valid_meta)):.2f} seconds/paper")
+        logger.info(f"📊 平均耗时: {((time.perf_counter()-t_all_start)/len(valid_meta)):.2f} seconds/paper")
 
 if __name__ == "__main__":
-    # 更新目录名为 v3.4
-    engine = EdgeScholarBatchEngine("./output/mineru_batch_v3.4")
+    # 指定输出目录为 v3.5
+    engine = EdgeScholarBatchEngine("./output/mineru_batch_v3.5")
     engine.run_benchmark("./input/osdi2025", batch_size=10)
